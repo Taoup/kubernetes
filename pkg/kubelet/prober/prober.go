@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -39,6 +41,9 @@ import (
 )
 
 const maxProbeRetries = 3
+
+// Requests cache for http probe
+var httpProbeReqCache sync.Map
 
 // Prober helps to check the liveness/readiness/startup of a container.
 type prober struct {
@@ -142,9 +147,27 @@ func (pb *prober) runProbe(ctx context.Context, probeType probeType, p *v1.Probe
 		return pb.exec.Probe(pb.newExecInContainer(ctx, container, containerID, command, timeout))
 
 	case p.HTTPGet != nil:
-		req, err := httpprobe.NewRequestForHTTPGetAction(p.HTTPGet, &container, status.PodIP, "probe")
-		if err != nil {
-			return probe.Unknown, "", err
+		var err error
+		var req *http.Request
+		key := probeKey{podUID: pod.UID, containerName: container.Name, probeType: probeType}
+		reqAny, found := httpProbeReqCache.Load(key)
+		// cache miss, create request object
+		if !found {
+			req, err = httpprobe.NewRequestForHTTPGetAction(p.HTTPGet, &container, status.PodIP, "probe")
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			httpProbeReqCache.Store(key, req)
+		} else {
+			req = reqAny.(*http.Request)
+		}
+		// cache hit, but pod IP changed, recreate the request object
+		if p.HTTPGet.Host == "" && req.URL.Hostname() != status.PodIP {
+			req, err = httpprobe.NewRequestForHTTPGetAction(p.HTTPGet, &container, status.PodIP, "probe")
+			if err != nil {
+				return probe.Unknown, "", err
+			}
+			httpProbeReqCache.Store(key, req)
 		}
 		if klogV4 := klog.V(4); klogV4.Enabled() {
 			port := req.URL.Port()
