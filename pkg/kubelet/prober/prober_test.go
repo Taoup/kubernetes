@@ -21,9 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -331,5 +333,76 @@ func TestNewExecInContainer(t *testing.T) {
 		if e, a := fmt.Sprintf("%v", test.err), fmt.Sprintf("%v", err); e != a {
 			t.Errorf("%s: error: expected %s, got %s", test.name, e, a)
 		}
+	}
+}
+
+type fakeHTTPProber struct{}
+
+func (p fakeHTTPProber) Probe(req *http.Request, timeOut time.Duration) (probe.Result, string, error) {
+	return probe.Success, "", nil
+}
+
+const nPods = 110
+const epoch = 5 * 60
+
+func runParallelProbes() {
+	ctx := context.Background()
+	containerID := kubecontainer.ContainerID{Type: "test", ID: "foobar"}
+	httpProbe := &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			HTTPGet: &v1.HTTPGetAction{Port: intstr.FromInt(80)},
+		},
+	}
+	prober := &prober{
+		http:     fakeHTTPProber{},
+		recorder: &record.FakeRecorder{},
+	}
+	var testPods = make([]v1.Pod, nPods)
+	var testContainers = make([]v1.Container, nPods*2)
+	for i := 0; i < nPods; i++ {
+		testContainers[2*i] = v1.Container{Name: fmt.Sprintf("pod-%d-container-1", i)}
+		testContainers[2*i+1] = v1.Container{Name: fmt.Sprintf("pod-%d-container-2", i)}
+		testPods[i] = v1.Pod{}
+	}
+	waiter := make(chan struct{})
+
+	for i := 0; i < nPods; i++ {
+		pod := testPods[i]
+		container1 := testContainers[2*i]
+		container2 := testContainers[2*i+1]
+		go func() {
+			for j := 0; j < epoch; j++ {
+				for _, probeType := range [...]probeType{liveness, readiness, startup} {
+					switch probeType {
+					case liveness:
+						container1.LivenessProbe = httpProbe
+						container2.LivenessProbe = httpProbe
+					case readiness:
+						container1.ReadinessProbe = httpProbe
+						container2.ReadinessProbe = httpProbe
+					case startup:
+						container1.StartupProbe = httpProbe
+						container2.StartupProbe = httpProbe
+					}
+					_, err := prober.probe(ctx, probeType, &pod, v1.PodStatus{PodIP: "10.0.0.1"}, container1, containerID)
+					if err != nil {
+						continue
+					}
+					_, err2 := prober.probe(ctx, probeType, &pod, v1.PodStatus{PodIP: "10.0.0.1"}, container2, containerID)
+					if err2 != nil {
+						continue
+					}
+				}
+			}
+			waiter <- struct{}{}
+		}()
+	}
+	for i := 0; i < nPods; i++ {
+		<-waiter
+	}
+}
+func BenchmarkProbe(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		runParallelProbes()
 	}
 }
